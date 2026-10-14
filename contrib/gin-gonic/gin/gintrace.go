@@ -23,6 +23,10 @@ import (
 
 const componentName = "gin-gonic/gin"
 
+// errHandlerPanic is the span error when the handler panics. It does not contain the panic value,
+// because that value can contain request data or credentials.
+var errHandlerPanic = errors.New("handler panicked")
+
 var instr *instrumentation.Instrumentation
 
 func init() {
@@ -55,8 +59,12 @@ func Middleware(service string, opts ...Option) gin.HandlerFunc {
 		opts = append(opts, cfg.routeTag(route, c.Request))
 		opts = append(opts, httptrace.HeaderTagsFromRequest(c.Request, cfg.headerTags))
 		span, ctx, finishSpans := httptrace.StartRequestSpan(c.Request, opts...)
+		returned := false
 		defer func() {
-			finishSpan(cfg, c, finishSpans)
+			if len(c.Errors) > 0 {
+				span.SetTag("gin.errors", c.Errors.String())
+			}
+			finishSpan(cfg, c, finishSpans, !returned)
 		}()
 
 		// pass the span through the request context
@@ -69,10 +77,7 @@ func Middleware(service string, opts ...Option) gin.HandlerFunc {
 
 		// serve the request to the next middleware
 		c.Next()
-
-		if len(c.Errors) > 0 {
-			span.SetTag("gin.errors", c.Errors.String())
-		}
+		returned = true
 	}
 }
 
@@ -93,8 +98,17 @@ func (cfg *config) routeTag(route string, req *http.Request) tracer.StartSpanOpt
 	return tracer.Tag(ext.HTTPRoute, route)
 }
 
-func finishSpan(cfg *config, c *gin.Context, finishSpans httptrace.FinishSpanFunc) {
+func finishSpan(cfg *config, c *gin.Context, finishSpans httptrace.FinishSpanFunc, panicked bool) {
 	status := c.Writer.Status()
+	if panicked {
+		// gin reports 200 until a status is written, and an outer recovery middleware only writes
+		// its own status after this span is finished.
+		if !c.Writer.Written() {
+			status = http.StatusInternalServerError
+		}
+		finishSpans(status, func(int) bool { return true }, tracer.WithError(errHandlerPanic), tracer.NoDebugStack())
+		return
+	}
 	if cfg.isStatusError == nil {
 		finishSpans(status, nil)
 		return

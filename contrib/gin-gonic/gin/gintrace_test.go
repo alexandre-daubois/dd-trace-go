@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -321,6 +322,77 @@ func TestError(t *testing.T) {
 		assert.Equal("gin-gonic/gin", span.Tag(ext.Component))
 		assert.Equal(componentName, span.Integration())
 	})
+}
+
+func TestPanic(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	for _, tt := range []struct {
+		name          string
+		recovery      bool
+		handler       gin.HandlerFunc
+		wantStatus    string
+		wantGinErrors any
+	}{
+		{
+			name:       "recovered by an outer middleware",
+			recovery:   true,
+			handler:    func(*gin.Context) { panic("secret") },
+			wantStatus: "500",
+		},
+		{
+			name:       "not recovered",
+			handler:    func(*gin.Context) { panic("secret") },
+			wantStatus: "500",
+		},
+		{
+			name:     "status already written",
+			recovery: true,
+			handler: func(c *gin.Context) {
+				c.Status(http.StatusAccepted)
+				c.Writer.WriteHeaderNow()
+				panic("secret")
+			},
+			wantStatus: "202",
+		},
+		{
+			name:     "gin errors before the panic",
+			recovery: true,
+			handler: func(c *gin.Context) {
+				_ = c.Error(errors.New("oops"))
+				panic("secret")
+			},
+			wantStatus:    "500",
+			wantGinErrors: "Error #01: oops\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			defer mt.Reset()
+
+			router := gin.New()
+			if tt.recovery {
+				router.Use(gin.RecoveryWithWriter(io.Discard))
+			}
+			router.Use(Middleware("foobar"))
+			router.GET("/panic", tt.handler)
+
+			serve := func() { router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/panic", nil)) }
+			if tt.recovery {
+				assert.NotPanics(t, serve)
+			} else {
+				assert.PanicsWithValue(t, "secret", serve)
+			}
+
+			spans := mt.FinishedSpans()
+			require.Len(t, spans, 1)
+			span := spans[0]
+			assert.Equal(t, tt.wantStatus, span.Tag(ext.HTTPCode))
+			assert.Equal(t, "handler panicked", span.Tag(ext.ErrorMsg))
+			assert.Empty(t, span.Tag(ext.ErrorStack))
+			assert.Equal(t, tt.wantGinErrors, span.Tag("gin.errors"))
+		})
+	}
 }
 
 func TestHTML(t *testing.T) {
